@@ -1440,7 +1440,7 @@ function section(title, body, more, meta) {
     attrs += ` data-qid="${qid}"`;
   }
   if (meta.albums && meta.albums.length) {
-    const min = meta.albums.map((a) => ({ id: a.id, title: a.title, artist: a.artist, thumbnail: a.thumbnail, year: a.year }));
+    const min = meta.albums.map((a) => ({ id: a.id, playlistId: a.playlistId || "", title: a.title, artist: a.artist, thumbnail: a.thumbnail, year: a.year }));
     attrs += ` data-albums="${encodeURIComponent(JSON.stringify(min))}"`;
   }
   if (attrs) h2 = `<h2 class="sec-title" role="button" tabindex="0" ${attrs} onkeydown="${KDACT}" onclick="openSectionQueue(this)">${esc(title)}${secIcon}</h2>`;
@@ -2125,11 +2125,22 @@ async function openAlbumQueue(title, albums, fromRoute, activeTab) {
   let albumObjs = albums;
   if (typeof albums[0] === "string") {
     await ensureFilters();
-    const results = await Promise.all(albums.map((id) => detailGet("/album?id=" + encodeURIComponent(id)).catch(() => null)));
-    albumObjs = results.filter((d) => d && !d.error && d.album && !hiddenArtist(d.album.artist)).map((d) => d.album);
+    const results = await Promise.all(albums.map(async (s) => {
+      const colon = s.indexOf(":");
+      const id = colon >= 0 ? s.slice(0, colon) : s;
+      const playlistId = colon >= 0 ? s.slice(colon + 1) : "";
+      const d = await detailGet("/album?id=" + encodeURIComponent(id)).catch(() => null);
+      if (d && !d.error && d.album && !hiddenArtist(d.album.artist)) return d.album;
+      if (playlistId) {
+        const pd = await fetchJSON("/playlist?id=" + encodeURIComponent(playlistId)).catch(() => null);
+        if (pd && pd.playlist) return { id, playlistId, title: pd.playlist.title || "", artist: "", thumbnail: pd.playlist.thumbnail || "", year: "" };
+      }
+      return null;
+    }));
+    albumObjs = results.filter(Boolean);
   }
-  if (!albumObjs.length) { el("v-detail").innerHTML = `<button class="backbtn" onclick="detailBack()"><svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg>Back</button>` + emptyState("No playable albums", "These albums are hidden by your filters."); return; }
-  const idsParam = albumObjs.map((a) => a.id).join(",");
+  if (!albumObjs.length) { el("v-detail").innerHTML = `<button class="backbtn" onclick="detailBack()"><svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg>Back</button>` + emptyState("No playable albums", "These albums are hidden by your filters or not available."); return; }
+  const idsParam = albumObjs.map((a) => a.id + (a.playlistId ? ":" + a.playlistId : "")).join(",");
   activeTab = activeTab || "albums";
   sectionState = { title, albums: albumObjs, tracks: [], activeTab, path: `/album-queue?title=${encodeURIComponent(title)}&ids=${idsParam}&tab=${activeTab}` };
   renderSectionView(fromRoute);
