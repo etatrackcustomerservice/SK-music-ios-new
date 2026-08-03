@@ -41,8 +41,22 @@ pub const MENU_LABEL_RESTART_UPDATE: &str = "Restart to update";
 /// Delay the launch check so it doesn't fight the initial shell/dataset load.
 const STARTUP_CHECK_DELAY_SECS: u64 = 8;
 
+/// Cap every check + download so a stalled request on a filtered network can't wedge the updater
+/// shut forever (a hung check would otherwise leave `CHECK_IN_PROGRESS` true and no-op all later
+/// "Check for updates" clicks).
+const UPDATE_TIMEOUT_SECS: u64 = 30;
+
 /// Guards against overlapping checks.
 static CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Resets `CHECK_IN_PROGRESS` on drop, so any return path — including an early `?` or a panic that
+/// unwinds — clears the guard rather than stranding it true and silently no-oping every later check.
+struct CheckGuard;
+impl Drop for CheckGuard {
+    fn drop(&mut self) {
+        CHECK_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
 /// Downloaded-but-not-installed update, awaiting an explicit restart/quit.
 static PENDING: Mutex<Option<PendingUpdate>> = Mutex::new(None);
 
@@ -69,40 +83,75 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Spawn the async check on Tauri's runtime. `user_initiated == false` stays quiet
-/// unless an update exists; `true` also surfaces up-to-date and error feedback.
+/// Last phase-defining `updater://*` broadcast, kept so a dialog that opens (or reloads) after the
+/// fact can still paint a verdict. Without it the dialog is only as good as its listeners' timing:
+/// `open_update_window` returns as soon as the window is *created*, so a check that resolves before
+/// `update.html` finishes loading lands on nobody and leaves the dialog spinning "Checking for
+/// updates…" forever. Progress ticks are deliberately not recorded — only phases.
+static LAST_STATUS: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+/// Broadcast a phase and remember it for `updater_last_status`.
+fn emit_status(app: &AppHandle, event: &str, payload: serde_json::Value) {
+    *LAST_STATUS.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(json!({ "event": event, "payload": payload }));
+    let _ = app.emit(event, payload);
+}
+
+/// Spawn the async check on Tauri's runtime. `user_initiated == false` stays quiet in the *SPA*
+/// (the payload carries the flag), but every phase is still broadcast so the update dialog can
+/// narrate a check it didn't start — including a silent one that failed.
 pub fn check_for_updates(app: &AppHandle, user_initiated: bool) {
     if CHECK_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-        return; // a check is already running
+        // A check is already running. Re-announce the phase rather than returning silently: a user
+        // who clicks "Check for updates" during the startup check would otherwise get a dialog that
+        // never resolves. The in-flight check's own terminal event still lands on the dialog.
+        if user_initiated {
+            let current = app.package_info().version.to_string();
+            emit_status(
+                app,
+                "updater://checking",
+                json!({ "userInitiated": true, "currentVersion": current }),
+            );
+        }
+        return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Clears CHECK_IN_PROGRESS on every exit from this task (Ok, Err, or a panic that unwinds).
+        let _guard = CheckGuard;
         if let Err(e) = run_check(&app, user_initiated).await {
-            if user_initiated {
-                let _ = app.emit(
-                    "updater://error",
-                    json!({ "userInitiated": user_initiated, "message": e }),
-                );
-            } else {
+            if !user_initiated {
                 eprintln!("[updater] check failed: {e}");
             }
+            // Emitted either way: a silent failure must still leave a terminal state behind, or a
+            // dialog opened afterwards sits on a stale "Checking…". The SPA keys off userInitiated.
+            emit_status(
+                &app,
+                "updater://error",
+                json!({ "userInitiated": user_initiated, "message": e }),
+            );
         }
-        CHECK_IN_PROGRESS.store(false, Ordering::SeqCst);
     });
 }
 
 async fn run_check(app: &AppHandle, user_initiated: bool) -> Result<(), String> {
     let current = app.package_info().version.to_string();
-    let _ = app.emit(
+    emit_status(
+        app,
         "updater://checking",
         json!({ "userInitiated": user_initiated, "currentVersion": current }),
     );
 
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater = app
+        .updater_builder()
+        .timeout(Duration::from_secs(UPDATE_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| e.to_string())?;
     let update = match updater.check().await.map_err(|e| e.to_string())? {
         Some(u) => u,
         None => {
-            let _ = app.emit(
+            emit_status(
+                app,
                 "updater://up-to-date",
                 json!({ "userInitiated": user_initiated, "currentVersion": current }),
             );
@@ -112,7 +161,30 @@ async fn run_check(app: &AppHandle, user_initiated: bool) -> Result<(), String> 
 
     let version = update.version.clone();
     let notes = update.body.clone();
-    let _ = app.emit(
+
+    // Already staged this exact version? Skip the (identical) re-download the daily loop would
+    // otherwise repeat every 24h, and just re-announce readiness so the UI can offer the restart.
+    if PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|p| p.update.version == version)
+    {
+        emit_status(
+            app,
+            "updater://ready",
+            json!({
+                "userInitiated": user_initiated,
+                "currentVersion": current,
+                "version": version,
+                "notes": notes,
+            }),
+        );
+        return Ok(());
+    }
+
+    emit_status(
+        app,
         "updater://update-available",
         json!({
             "userInitiated": user_initiated,
@@ -145,7 +217,8 @@ async fn run_check(app: &AppHandle, user_initiated: bool) -> Result<(), String> 
 
     *PENDING.lock().unwrap() = Some(PendingUpdate { update, bytes });
 
-    let _ = app.emit(
+    emit_status(
+        app,
         "updater://ready",
         json!({
             "userInitiated": user_initiated,
@@ -163,17 +236,26 @@ async fn run_check(app: &AppHandle, user_initiated: bool) -> Result<(), String> 
 pub fn install_pending_and_restart(app: &AppHandle) {
     let pending = PENDING.lock().unwrap().take();
     match pending {
-        Some(p) => match p.update.install(&p.bytes) {
-            Ok(()) => {
-                app.restart();
+        Some(p) => {
+            // Tear the webviews down BEFORE installing — mirrors the tray Quit path. `install()` on
+            // Windows runs the NSIS installer + a hard process::exit(0) with WebView2 still alive,
+            // which leaves the profile locked and hangs the immediate NSIS-triggered relaunch.
+            for (_, win) in app.webview_windows() {
+                let _ = win.destroy();
             }
-            Err(e) => {
-                let _ = app.emit(
-                    "updater://error",
-                    json!({ "userInitiated": true, "message": format!("install failed: {e}") }),
-                );
+            match p.update.install(&p.bytes) {
+                Ok(()) => {
+                    app.restart();
+                }
+                Err(e) => {
+                    emit_status(
+                        app,
+                        "updater://error",
+                        json!({ "userInitiated": true, "message": format!("install failed: {e}") }),
+                    );
+                }
             }
-        },
+        }
         None => check_for_updates(app, true),
     }
 }
@@ -216,6 +298,32 @@ pub fn open_update_window(app: &AppHandle) {
     }
 }
 
+/// Bridge the About page's Updates card. The main window is REMOTE content, so it can't invoke
+/// `updater_check` / `updater_version` (the default capability grants core events only) — it emits
+/// instead, and we answer:
+///   SPA -> Rust : `sk-check-updates {}` · `sk-app-version-request {}`
+///   Rust -> SPA : `sk-app-version { version }`
+/// The existing `updater://*` broadcasts and the update dialog narrate the check itself, so this is
+/// only the trigger + the installed-version readout. Deliberately no "restart to update" event —
+/// that button lives on the local dialog (which can invoke `updater_restart` directly), so a
+/// compromised remote page can't force a restart mid-playback.
+pub fn hook_spa_events(app: &AppHandle) {
+    use tauri::Listener;
+
+    let h = app.clone();
+    app.listen("sk-check-updates", move |_| {
+        open_update_window(&h); // the dialog narrates the check the next line kicks off
+        check_for_updates(&h, true);
+    });
+    let h = app.clone();
+    app.listen("sk-app-version-request", move |_| {
+        let _ = h.emit(
+            "sk-app-version",
+            json!({ "version": h.package_info().version.to_string() }),
+        );
+    });
+}
+
 /// Route tray menu items owned by this module. Returns `true` when handled so the
 /// tray module can early-return.
 pub fn handle_menu_event(app: &AppHandle, id: &str) -> bool {
@@ -249,4 +357,15 @@ pub fn updater_restart(app: AppHandle) {
 #[tauri::command]
 pub fn updater_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
+}
+
+/// The last `updater://*` phase, as `{ event, payload }` (null if nothing has run yet). The dialog
+/// calls this on load so it paints a verdict even when the check it was opened alongside resolved
+/// before its listeners were attached — the "opens, then spins forever" bug.
+#[tauri::command]
+pub fn updater_last_status() -> Option<serde_json::Value> {
+    LAST_STATUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }

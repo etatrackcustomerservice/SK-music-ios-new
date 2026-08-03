@@ -1,5 +1,6 @@
 node_modules/
 .env
+.env.*
 *.local.md
 
 # fetched catalog snapshot (rebuilt in CI; large/binary — never source)
@@ -23,3 +24,6 @@ dist/
 # local editor/agent config
 .claude/
 .vercel
+
+# forum post drafts — writing scratch, not part of the app
+forum-posts/

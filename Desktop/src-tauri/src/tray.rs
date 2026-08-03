@@ -41,6 +41,8 @@ struct TrayHandles {
     menu: Menu<Wry>,
     now_playing: MenuItem<Wry>,
     play_pause: MenuItem<Wry>,
+    /// "Start radio from this song" when something's playing, else "Start radio" (generic mix).
+    radio: MenuItem<Wry>,
     up_next: Submenu<Wry>,
     autostart: CheckMenuItem<Wry>,
     notify: CheckMenuItem<Wry>,
@@ -74,7 +76,8 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let next_i = MenuItem::with_id(app, "next", "Next", true, None::<&str>)?;
     let prev_i = MenuItem::with_id(app, "previous", "Previous", true, None::<&str>)?;
     let like_i = MenuItem::with_id(app, "like", "Like this song", true, None::<&str>)?;
-    let radio_i = MenuItem::with_id(app, "radio", "Start radio from this song", true, None::<&str>)?;
+    // Starts as the no-track label (nothing plays at launch); set_now_playing swaps it live.
+    let radio_i = MenuItem::with_id(app, "radio", "Start radio", true, None::<&str>)?;
 
     let mini_i = MenuItem::with_id(app, "mini", "Mini player", true, None::<&str>)?;
     let show_i = MenuItem::with_id(app, "show", "Show SK Music", true, None::<&str>)?;
@@ -193,12 +196,18 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             }
         })
         .on_tray_icon_event(|tray, event| match event {
+            // Left click = quick controls: surface the mini player AND pop the full menu, exactly
+            // like a right click. Double click opens the main app.
             TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
+            } => {
+                let app = tray.app_handle();
+                crate::mini::show(app);
+                show_app_menu_inner(app);
             }
-            | TrayIconEvent::DoubleClick {
+            TrayIconEvent::DoubleClick {
                 button: MouseButton::Left,
                 ..
             } => show_and_focus(tray.app_handle()),
@@ -220,6 +229,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         menu,
         now_playing: now_playing_i,
         play_pause: play_pause_i,
+        radio: radio_i,
         up_next: up_next_i,
         autostart: autostart_i,
         notify: notify_i,
@@ -231,16 +241,34 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Right-click inside the main window pops the SAME menu as the tray (invoked by the SPA's
-/// contextmenu handler through the bridge). Popup position defaults to the cursor.
+/// Right-click inside the main window pops the SAME menu as the tray. Reached two ways: the
+/// `show_app_menu` command (local pages) and the `sk-menu` event (the REMOTE SPA — remote origins
+/// can't invoke app commands, so it emits instead; see media::hook_report_events). Popup position
+/// defaults to the cursor.
+pub fn show_app_menu_inner(app: &tauri::AppHandle) {
+    // Anchor the cursor-positioned popup on a VISIBLE window — a hidden owner (main closed to
+    // tray) makes Windows auto-dismiss the menu immediately.
+    let window = app
+        .get_webview_window(crate::mini::LABEL)
+        .filter(|w| w.is_visible().unwrap_or(false))
+        .or_else(|| app.get_webview_window(MAIN_WINDOW).filter(|w| w.is_visible().unwrap_or(false)))
+        .or_else(|| app.get_webview_window(MAIN_WINDOW));
+    let Some(window) = window else { return };
+    // CRITICAL: clone the (cheap handle) menu and DROP the guard before popping it. popup_menu runs
+    // a blocking modal message loop (TrackPopupMenu) that still pumps run_on_main_thread tasks — a
+    // position tick landing mid-menu re-enters set_playing → HANDLES.lock() on this same thread and
+    // self-deadlocks. Holding no lock across the modal loop is the fix.
+    let menu = HANDLES
+        .get()
+        .and_then(|l| l.lock().ok().map(|h| h.menu.clone()));
+    if let Some(menu) = menu {
+        let _ = window.popup_menu(&menu);
+    }
+}
+
 #[tauri::command]
 pub fn show_app_menu(app: tauri::AppHandle) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW) else { return };
-    if let Some(lock) = HANDLES.get() {
-        if let Ok(h) = lock.lock() {
-            let _ = window.popup_menu(&h.menu);
-        }
-    }
+    show_app_menu_inner(&app);
 }
 
 /// Flip the persisted "Mini player when unfocused" setting and mirror it into the check item.
@@ -248,9 +276,10 @@ fn toggle_auto_mini() {
     let desired = !crate::settings::auto_mini();
     crate::settings::set_auto_mini(desired);
     if let Some(lock) = HANDLES.get() {
-        if let Ok(h) = lock.lock() {
-            let _ = h.auto_mini.set_checked(desired);
-        }
+        // Recover a poisoned lock rather than no-op: the tray handles are trivially re-usable, so a
+        // prior panic must not permanently wedge the tray shut.
+        let h = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = h.auto_mini.set_checked(desired);
     }
 }
 
@@ -259,7 +288,7 @@ fn toggle_auto_mini() {
 /// main thread).
 pub fn set_now_playing(title: Option<&str>, artist: Option<&str>, playing: bool) {
     let Some(lock) = HANDLES.get() else { return };
-    let Ok(mut h) = lock.lock() else { return };
+    let mut h = lock.lock().unwrap_or_else(|e| e.into_inner());
     let line = match (title, artist) {
         (Some(t), Some(a)) => format!("{t} — {a}"),
         (Some(t), None) => t.to_string(),
@@ -273,13 +302,15 @@ pub fn set_now_playing(title: Option<&str>, artist: Option<&str>, playing: bool)
     };
     let _ = h.now_playing.set_text(label.as_str());
     let _ = h.play_pause.set_text(if playing { "Pause" } else { "Play" });
+    // With a current track, radio seeds from it; with nothing playing, offer a generic mix instead.
+    let _ = h.radio.set_text(if title.is_some() { "Start radio from this song" } else { "Start radio" });
     apply_icon(&mut h, playing);
 }
 
 /// Update only the Play/Pause label + tray-icon badge (on play/pause without a track change).
 pub fn set_playing(playing: bool) {
     let Some(lock) = HANDLES.get() else { return };
-    let Ok(mut h) = lock.lock() else { return };
+    let mut h = lock.lock().unwrap_or_else(|e| e.into_inner());
     let _ = h.play_pause.set_text(if playing { "Pause" } else { "Play" });
     apply_icon(&mut h, playing);
 }
@@ -289,7 +320,7 @@ pub fn set_playing(playing: bool) {
 /// there via `playindex:<n>`. Up to 6 entries; an empty/absent queue shows a disabled placeholder.
 pub fn set_up_next(app: &tauri::AppHandle, queue_base: Option<u64>, queue: Option<&[QueueEntry]>) {
     let Some(lock) = HANDLES.get() else { return };
-    let Ok(h) = lock.lock() else { return };
+    let h = lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // Clear existing children (rebuild wholesale — the list is tiny).
     if let Ok(items) = h.up_next.items() {
@@ -310,7 +341,9 @@ pub fn set_up_next(app: &tauri::AppHandle, queue_base: Option<u64>, queue: Optio
 
     let base = queue_base.unwrap_or(0);
     for (i, e) in entries.iter().take(6).enumerate() {
-        let abs = base + i as u64;
+        // saturating: `queue_base` is attacker-suppliable from the webview payload; a debug overflow
+        // panic here fires while HANDLES is locked, poisoning the mutex and freezing the tray.
+        let abs = base.saturating_add(i as u64);
         let title = e
             .title
             .as_deref()
@@ -337,9 +370,8 @@ fn toggle_autostart(app: &tauri::AppHandle) {
     // Only claim the new state if the toggle actually took.
     let desired = if result.is_ok() { !enabled } else { enabled };
     if let Some(lock) = HANDLES.get() {
-        if let Ok(h) = lock.lock() {
-            let _ = h.autostart.set_checked(desired);
-        }
+        let h = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = h.autostart.set_checked(desired);
     }
     if let Err(e) = result {
         eprintln!("[tray] autostart toggle failed: {e}");
@@ -352,9 +384,8 @@ fn toggle_notify() {
     let desired = !crate::settings::notify_on_track();
     crate::settings::set_notify_on_track(desired);
     if let Some(lock) = HANDLES.get() {
-        if let Ok(h) = lock.lock() {
-            let _ = h.notify.set_checked(desired);
-        }
+        let h = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = h.notify.set_checked(desired);
     }
 }
 
@@ -381,14 +412,30 @@ fn apply_icon(h: &mut TrayHandles, playing: bool) {
     }
 }
 
-/// Build the idle + "playing" tray icon variants from the app's default window icon. Returns
-/// `(None, None)` if the app has no default icon.
+/// The bundled 128px icon, decoded and Lanczos-resized to tray size at startup. Handing the tray
+/// the full-size window icon leaves the downscale to Windows, which renders it blurry.
+const TRAY_SOURCE: &[u8] = include_bytes!("../icons/128x128.png");
+const TRAY_SIZE: u32 = 32;
+
+/// Build the idle + "playing" tray icon variants. Returns `(None, None)` only if both the bundled
+/// PNG decode AND the default-window-icon fallback are unavailable.
 fn build_icons(app: &tauri::AppHandle) -> (Option<Image<'static>>, Option<Image<'static>>) {
-    let Some(base) = app.default_window_icon() else {
+    let idle = image::load_from_memory(TRAY_SOURCE)
+        .ok()
+        .map(|img| {
+            let small = img
+                .resize_exact(TRAY_SIZE, TRAY_SIZE, image::imageops::FilterType::Lanczos3)
+                .into_rgba8();
+            Image::new_owned(small.into_raw(), TRAY_SIZE, TRAY_SIZE)
+        })
+        .or_else(|| {
+            app.default_window_icon()
+                .map(|b| Image::new_owned(b.rgba().to_vec(), b.width(), b.height()))
+        });
+    let Some(idle) = idle else {
         return (None, None);
     };
-    let idle = Image::new_owned(base.rgba().to_vec(), base.width(), base.height());
-    let playing = make_playing_icon(base).unwrap_or_else(|| idle.clone());
+    let playing = make_playing_icon(&idle).unwrap_or_else(|| idle.clone());
     (Some(idle), Some(playing))
 }
 
@@ -487,10 +534,14 @@ fn in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bo
 fn hook_close_to_tray(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
         let win = window.clone();
+        let handle = app.clone();
         window.on_window_event(move |event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = win.hide();
+                // Hiding doesn't emit a Focused(false) the mini's hook could see — surface the mini
+                // explicitly so close-to-tray keeps a control on screen while playing.
+                crate::mini::auto_show(&handle);
             }
         });
     }

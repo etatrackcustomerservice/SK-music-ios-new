@@ -531,7 +531,7 @@ if (!CODE_ONLY) { // ===== full build: corpus → dataset + per-entity detail + 
     `\n</sitemapindex>\n`,
   );
   ensureWrite(path.join(DIST, "robots.txt"),
-    `User-agent: *\nAllow: /\nDisallow: /analytics\n\nSitemap: ${SITE}/sitemap.xml\n`);
+    `User-agent: *\nAllow: /\nDisallow: /analytics\nDisallow: /admin\n\nSitemap: ${SITE}/sitemap.xml\n`);
   console.log(`  sitemaps: ${registeredSitemaps.length} files + index (${tracks.length + artists.length + albums.length + playlists.length} entity URLs) → ${SITE}/sitemap.xml`);
 
   // IndexNow (Bing/Edge instant indexing) — the key file must sit at the site root and
@@ -742,13 +742,13 @@ ensureWrite(path.join(DIST, "playback-block-test.html"), fs.readFileSync(path.jo
 // Cache versioned per build: V changes → old caches evicted on activate.
 // Strategy: navigate = network-first, /lib = network-first, /data = cache-first.
 const SW = `const V = "skmusic-${BUILD}";
-const SHELL = ["/","/lib/engine.mjs?v=${BUILD}","/lib/engine-worker.mjs?v=${BUILD}","/lib/categories.mjs?v=${BUILD}","/lib/search.mjs?v=${BUILD}","/lib/normalize.mjs?v=${BUILD}","/lib/synonyms.mjs?v=${BUILD}","/data/meta.json?v=${BUILD}","/data/home.json?v=${BUILD}","/data/home.kidzone.json?v=${BUILD}","/data/artists.json?v=${BUILD}","/data/synonyms.json?v=${BUILD}","/data/zemer-playlists.json?v=${BUILD}","/data/blocked-ids.json?v=${BUILD}"];
-self.addEventListener("install", (e) => { self.skipWaiting(); e.waitUntil(caches.open(V).then((c) => c.addAll(SHELL)).catch(() => {})); });
+const SHELL = ["/","/lib/engine.mjs?v=${BUILD}","/lib/engine-worker.mjs?v=${BUILD}","/lib/categories.mjs?v=${BUILD}","/lib/search.mjs?v=${BUILD}","/lib/normalize.mjs?v=${BUILD}","/lib/synonyms.mjs?v=${BUILD}","/data/meta.json","/data/home.json","/data/home.kidzone.json","/data/artists.json","/data/synonyms.json","/data/zemer-playlists.json","/data/blocked-ids.json"];
+self.addEventListener("install", (e) => { self.skipWaiting(); e.waitUntil(caches.open(V).then((c) => c.addAll(SHELL))); }); // no .catch: a mid-install failure must REJECT so the browser keeps the previous SW+cache and retries, instead of activating an empty cache
 self.addEventListener("activate", (e) => { e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== V).map((k) => caches.delete(k)))).then(() => self.clients.claim())); });
 self.addEventListener("fetch", (e) => {
   const u = new URL(e.request.url);
   if (e.request.method !== "GET" || u.origin !== location.origin || u.pathname === "/playlist") return;
-  if (e.request.mode === "navigate") { e.respondWith(fetch(e.request).then((r) => { if (r.ok && u.pathname === "/") { const cp = r.clone(); caches.open(V).then((c) => c.put("/", cp)); } return r; }).catch(() => caches.open(V).then((c) => c.match("/")))); return; } // cache the shell only from real root visits — /trending, /analytics, /test return OTHER html that must never poison the offline "/"
+  if (e.request.mode === "navigate") { e.respondWith(fetch(e.request).then((r) => { if (r.ok && u.pathname === "/") { const cp = r.clone(); caches.open(V).then((c) => c.put("/", cp)); } return r; }).catch(() => caches.open(V).then((c) => c.match("/")).then((m) => m || new Response("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Offline - SK Music</title><body style='margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;text-align:center'><div style='padding:24px'><h1 style='font-size:20px;margin:0 0 8px'>You are offline</h1><p style='margin:0;color:#94a3b8'>SK Music cannot reach the network right now. Reconnect and try again.</p></div></body>", { status: 503, headers: { "Content-Type": "text/html; charset=utf-8" } })))); return; } // network-first; offline fall back to cached "/" or a minimal inline offline page (never respondWith(undefined), which is a network error)
   if (u.pathname.startsWith("/lib/")) { // engine code: network-first so a freshly-served shell never runs against a stale engine (falls back to cache offline)
     e.respondWith(fetch(e.request).then((r) => { if (r.ok) { const cp = r.clone(); caches.open(V).then((c) => c.put(e.request, cp)); } return r; }).catch(() => caches.open(V).then((c) => c.match(e.request))));
   } else if (u.pathname.startsWith("/data/")) { // data: cache-first (large + stable; the versioned cache + post-deploy reload refresh it)
@@ -784,7 +784,10 @@ const CSP = [
   // so pin the inert image channel to any-https rather than whack-a-mole a host list. The exfil-relevant
   // directives (connect/script/frame/object/base) stay tight.
   "img-src 'self' data: blob: https:",
-  "media-src 'self' blob: https://*.vercel.app",
+  // Vercel stream (*.vercel.app) is used by the iOS PWA html5 <audio> fallback.
+  // skdl: is the SK Music DESKTOP app's offline-download scheme (Tauri custom URI scheme served from
+  // Rust; src/download.rs). Inert in a browser — no such origin exists there.
+  "media-src 'self' blob: https://*.vercel.app skdl: http://skdl.localhost https://skdl.localhost",
   "frame-src https://www.youtube.com https://www.youtube-nocookie.com",
   // ipc: + ipc.localhost are the Tauri desktop app's IPC transport (invoke → now_playing/set_playback_state);
   // harmless for browsers, required so the desktop media bridge isn't blocked.
